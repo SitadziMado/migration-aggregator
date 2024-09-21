@@ -16,16 +16,6 @@ import pglast.enums.parsenodes as nodes
 from queries import *
 
 
-OBJECT_TYPES = (
-    "FUNCTION",
-    "INDEX",
-    "SCHEMA",
-    "TABLE",
-    "TRIGGER",
-    "TYPE",
-)
-
-
 def eprint(*args, **kwargs):
     print(*args, file=stderr, **kwargs)
 
@@ -304,11 +294,14 @@ def _parse_arguments(argv) -> argparse.Namespace:
         "output_dir",
         help="An output directory where to emit the resulting aggregated schemas",
     )
+
+    object_types = [e.name for e in ObjectType if e != ObjectType.UNKNOWN]
+
     parser.add_argument(
         "-t",
         "--types",
-        choices=OBJECT_TYPES,
-        default=OBJECT_TYPES,
+        choices=object_types,
+        default=object_types,
         nargs="*",
         type=tuple,
     )
