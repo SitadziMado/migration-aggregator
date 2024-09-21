@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from enum import Enum, auto
 from sys import stderr
 from typing import Any, Callable, Dict, List, Self, Tuple
 
@@ -13,13 +14,26 @@ def _range_var_to_tuple(range_var: ast.RangeVar) -> Tuple[str, str]:
     )
 
 
+class ConflictBehavior(Enum):
+    FAIL = auto()
+    IGNORE = auto()
+    REPLACE = auto()
+
+
 class Create:
     @abstractmethod
     def name(self) -> tuple:
         pass
 
+    @abstractmethod
+    def conflict_behavior(self) -> ConflictBehavior:
+        pass
+
     def columns(self) -> List[ast.ColumnDef]:
         return [child for child in self.children if isinstance(child, ast.ColumnDef)]
+
+    def constraints(self) -> List[ast.Constraint]:
+        return [child for child in self.children if isinstance(child, ast.Constraint)]
 
 
 class CreateTable(Create):
@@ -28,6 +42,13 @@ class CreateTable(Create):
 
     def name(self):
         return _range_var_to_tuple(self.statement.relation)
+
+    def conflict_behavior(self) -> bool:
+        return (
+            ConflictBehavior.IGNORE
+            if self.statement.if_not_exists
+            else ConflictBehavior.FAIL
+        )
 
     @property
     def children(self):
@@ -44,6 +65,9 @@ class CreateType(Create):
 
     def name(self):
         return _range_var_to_tuple(self.statement.typevar)
+
+    def conflict_behavior(self) -> bool:
+        return ConflictBehavior.FAIL
 
     @property
     def children(self):
@@ -64,6 +88,13 @@ class CreateIndex(Create):
             self.statement.idxname,
         )
 
+    def conflict_behavior(self) -> bool:
+        return (
+            ConflictBehavior.IGNORE
+            if self.statement.if_not_exists
+            else ConflictBehavior.FAIL
+        )
+
 
 class CreateFunction(Create):
     def __init__(self, statement: ast.CreateFunctionStmt) -> None:
@@ -72,6 +103,13 @@ class CreateFunction(Create):
     def name(self) -> tuple:
         return tuple(part.sval for part in self.statement.funcname)
 
+    def conflict_behavior(self) -> bool:
+        return (
+            ConflictBehavior.REPLACE
+            if self.statement.replace
+            else ConflictBehavior.FAIL
+        )
+
 
 class CreateEnum(Create):
     def __init__(self, statement: ast.CreateEnumStmt) -> None:
@@ -79,6 +117,9 @@ class CreateEnum(Create):
 
     def name(self):
         return tuple(part.sval for part in self.statement.typeName)
+
+    def conflict_behavior(self) -> ConflictBehavior:
+        return ConflictBehavior.FAIL
 
 
 class CreateTrigger(Create):
@@ -91,6 +132,13 @@ class CreateTrigger(Create):
             self.statement.trigname,
         )
 
+    def conflict_behavior(self) -> ConflictBehavior:
+        return (
+            ConflictBehavior.REPLACE
+            if self.statement.replace
+            else ConflictBehavior.FAIL
+        )
+
 
 class CreateSchema(Create):
     def __init__(self, statement: ast.CreateSchemaStmt) -> None:
@@ -98,6 +146,13 @@ class CreateSchema(Create):
 
     def name(self) -> Tuple:
         return (self.statement.schemaname,)
+
+    def conflict_behavior(self) -> ConflictBehavior:
+        return (
+            ConflictBehavior.IGNORE
+            if self.statement.if_not_exists
+            else ConflictBehavior.FAIL
+        )
 
 
 class AlterTable:

@@ -30,9 +30,42 @@ def eprint(*args, **kwargs):
     print(*args, file=stderr, **kwargs)
 
 
+def appended(container: tuple | None, value: Any) -> tuple:
+    return (container or tuple()) + (value,)
+
+
+def removed(container: tuple, index: int) -> tuple:
+    return container[:index] + container[index + 1 :]
+
+
+def removed_by(
+    container: tuple | None, is_missing_ok: bool, pred: Callable[[Any], bool]
+) -> tuple:
+    container = container or tuple()
+
+    for index, item in enumerate(container):
+        if pred(item):
+            return removed(container, index)
+
+    if not is_missing_ok:
+        raise ValueError("Value is absent from the tuple")
+
+    return container
+
+
+def find_by(
+    container: tuple | None, pred: Callable[[Any], bool]
+) -> Tuple[int | None, Any | None]:
+    for index, item in enumerate(container or tuple()):
+        if pred(item):
+            return index, item
+
+    return None, None
+
+
 def _constraint_name(
-    relation: ast.RangeVar, column: ast.ColumnDef, constraint_type: nodes.ConstrType
-):
+    relation_name: str, column_name: str, constraint_type: nodes.ConstrType
+) -> str | None:
     mapping = {
         nodes.ConstrType.CONSTR_PRIMARY: "pkey",
         nodes.ConstrType.CONSTR_UNIQUE: "key",
@@ -42,10 +75,10 @@ def _constraint_name(
         nodes.ConstrType.CONSTR_CHECK: "check",
     }
 
-    # ToDo: fix this
-    return "_".join(
-        [relation.relname, column.colname, mapping.get(constraint_type, "None")]
-    )
+    suffix = mapping.get(constraint_type, "None")
+
+    if suffix:
+        return "_".join([relation_name, column_name, suffix])
 
 
 class UnsupportedStatementError(Exception):
@@ -59,41 +92,102 @@ class Repository:
         self.rows = dict()
 
     def create(self, statement: Create):
-        # ToDo: process IF NOT EXISTS
+        name = statement.name()
+
+        if name in self.rows:
+            match statement.conflict_behavior:
+                case ConflictBehavior.FAIL:
+                    raise ValueError(f"Entity '{name}' already exists in the database")
+                case ConflictBehavior.IGNORE:
+                    return
+
         self.rows[statement.name()] = statement
 
     def alter(self, statement: AlterTable):
         this: Create = self.rows[statement.name()]
+
+        def find_column_by_name(name: str) -> ast.ColumnDef | None:
+            return find_by(this.columns(), lambda x: x.colname == name)[1]
+
+        def add_column_constraint(column: ast.ColumnDef, constraint: ast.Constraint):
+            column.constraints = appended(column.constraints, constraint)
+
         unsupported = []
 
         for command in statement.statement.cmds:
             match command.subtype:
                 case nodes.AlterTableType.AT_AddColumn:
-                    this.children = this.children + (command.def_,)
+                    this.children = appended(this.children, command.def_)
                 case nodes.AlterTableType.AT_DropColumn:
-                    this.children = tuple(
-                        column
-                        for column in this.children
-                        if isinstance(column, ast.ColumnDef)
-                        and column.colname != command.name
+                    this.children = removed_by(
+                        this.children,
+                        command.missing_ok,
+                        lambda x: isinstance(x, ast.ColumnDef)
+                        and x.colname == command.name,
                     )
-                # case nodes.AlterTableType.AT_SetNotNull:
-                #     for child in this.columns():
-                #         if child.colname == command.name:
-                #             child.is_not_null = True
-                # case nodes.AlterTableType.AT_DropNotNull:
-                #     for child in this.columns():
-                #         if child.colname == command.name:
-                #             child.is_not_null = False
-                case nodes.AlterTableType.AT_ColumnDefault:
-                    for child in this.columns():
-                        if child.colname == command.name:
-                            child.constraints = child.constraints + (
-                                ast.Constraint(
-                                    contype=nodes.ConstrType.CONSTR_DEFAULT,
-                                    raw_expr=command.def_,
-                                ),
+                case nodes.AlterTableType.AT_AddConstraint:
+                    this.children = appended(this.children, command.def_)
+                case nodes.AlterTableType.AT_DropConstraint:
+
+                    def constraint_matches_by_name(
+                        constraint: ast.ColumnDef | ast.Constraint,
+                    ):
+                        return (
+                            isinstance(constraint, ast.Constraint)
+                            and constraint.conname == command.name
+                        )
+
+                    index, constraint = find_by(
+                        this.children, constraint_matches_by_name
+                    )
+
+                    if constraint:
+                        this.children = removed(this.children, index)
+                    else:
+                        constraint_removed = False
+
+                        for column in this.columns():
+                            index, _ = find_by(
+                                column.constraints,
+                                lambda x: _constraint_name(
+                                    statement.statement.relation.relname,
+                                    column.colname,
+                                    x.contype,
+                                )
+                                == command.name,
                             )
+
+                            if index is not None:
+                                constraint_removed = True
+                                column.constraints = removed(column.constraints, index)
+                                break
+
+                        if not (command.missing_ok or constraint_removed):
+                            raise ValueError(
+                                f"Failed to update constraint with name {command.name}"
+                            )
+                case nodes.AlterTableType.AT_SetNotNull:
+                    add_column_constraint(
+                        find_column_by_name(command.name),
+                        ast.Constraint(
+                            contype=nodes.ConstrType.CONSTR_NOTNULL,
+                        ),
+                    )
+                case nodes.AlterTableType.AT_DropNotNull:
+                    column = find_column_by_name(command.name)
+                    column.constraints = removed_by(
+                        column.constraints,
+                        command.missing_ok,
+                        lambda x: x.contype == nodes.ConstrType.CONSTR_NOTNULL,
+                    )
+                case nodes.AlterTableType.AT_ColumnDefault:
+                    add_column_constraint(
+                        find_column_by_name(command.name),
+                        ast.Constraint(
+                            contype=nodes.ConstrType.CONSTR_DEFAULT,
+                            raw_expr=command.def_,
+                        ),
+                    )
                 case _:
                     unsupported.append(command)
 
@@ -102,21 +196,6 @@ class Repository:
             clone.cmds = unsupported
 
             raise UnsupportedStatementError(clone)
-        #     case nodes.AlterTableType.AT_AddConstraint:
-        #       this.tableElts = this.tableElts + (command.def_,)
-        #     case nodes.AlterTableType.AT_DropConstraint:
-        #       # def is_suitable_constraint(constraint: ast.ColumnDef | ast.Constraint):
-        #       #   if isinstance(constraint, ast.Constraint):
-        #       #     return constraint.conname == command.name or _constraint_name(statement.relation, column, constraint.contype) == command.name
-
-        #       # constraint = _find(target, is_suitable_constraint)
-
-        #       for column in this.tableElts:
-        #         if isinstance(column, ast.ColumnDef):
-        #           for index, constraint in enumerate(column.constraints or []):
-        #             if constraint.conname == command.name or _constraint_name(statement.relation, column, constraint.contype) == command.name:
-        #               this.tableElts = this.tableElts[:index] + this.tableElts[index + 1:]
-        #               return  # ToDo: fix the copypaste
 
     def drop(self, statement: Drop):
         for name in statement.names():
@@ -186,6 +265,7 @@ class Schema:
                 self.repositories[ObjectType.from_object_type(statement.objtype)].alter(
                     AlterTable(statement)
                 )
+            # ToDo: support ALTER TYPE statements
             # case ast.AlterTypeStmt():
             #     pass
             # case ast.AlterEnumStmt():
@@ -279,13 +359,13 @@ def main():
             output_dir.joinpath(f"final_schema_{object_type.lower()}.sql"), "w"
         ) as f:
             for statement in repo.rows.values():
-                print(IndentedStream()(statement.statement), '\n', sep=';', file=f)
+                print(IndentedStream()(statement.statement), "\n", sep=";", file=f)
 
     print(f"Emitting the unsupported statements to: '{output_dir}/unsupported.sql'")
 
     with open(output_dir.joinpath(f"unsupported.sql"), "w") as f:
         for statement in skipped:
-            print(IndentedStream()(statement), '\n', sep=';', file=f)
+            print(IndentedStream()(statement), "\n", sep=";", file=f)
 
     print("Work finished")
 
